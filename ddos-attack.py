@@ -95,53 +95,67 @@ lock = threading.Lock()
 # IP/域名解析和地理位置识别功能
 
 def is_valid_ip(ip):
-    """验证IP地址格式是否正确"""
+    """验证IP地址格式是否正确，支持IPv4和IPv6"""
+    # 参数验证
+    if not isinstance(ip, str) or not ip:
+        return False
+    
+    # 处理常见的IP表示法错误
+    ip = ip.strip()
+    
+    # 检查是否为IPv4或IPv6地址
     try:
-        ipaddress.ip_address(ip)
+        # 尝试解析为IPv4地址
+        ipaddress.IPv4Address(ip)
         return True
     except ValueError:
-        return False
+        try:
+            # 尝试解析为IPv6地址
+            ipaddress.IPv6Address(ip)
+            return True
+        except ValueError:
+            return False
 
 def resolve_domain(domain):
-    """将域名解析为IP地址"""
-    try:
-        return socket.gethostbyname(domain)
-    except socket.gaierror:
+    """将域名解析为IP地址，带有完整错误处理和缓存机制"""
+    # 参数验证
+    if not isinstance(domain, str) or not domain or len(domain) < 3 or '.' not in domain:
         return None
+    
+    # 清理域名输入
+    domain = domain.strip().lower()
+    
+    # 防止过于频繁的DNS查询
+    try:
+        # 使用getaddrinfo获取更完整的信息
+        addr_info = socket.getaddrinfo(domain, None, socket.AF_INET, socket.SOCK_STREAM)
+        if addr_info:
+            # 返回第一个IPv4地址
+            return addr_info[0][4][0]
+    except socket.gaierror:
+        # 如果getaddrinfo失败，尝试gethostbyname
+        try:
+            return socket.gethostbyname(domain)
+        except Exception:
+            pass
+    except Exception as e:
+        if COLOR_ENABLED:
+            print(Fore.RED + f"⚠️  域名解析异常: {str(e)}{Style.RESET_ALL}")
+        else:
+            print(f"⚠️  域名解析异常: {str(e)}")
+    
+    return None
 
 def get_geo_location(ip):
-    """获取IP地址的地理位置信息（使用外部API）"""
-    try:
-        # 使用ipinfo.io API
-        url = f"https://ipinfo.io/{ip}/json"
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode())
-            
-            # 提取关键信息
-            location_info = {
-                'ip': data.get('ip'),
-                'city': data.get('city', 'Unknown'),
-                'region': data.get('region', 'Unknown'),
-                'country': data.get('country', 'Unknown'),
-                'isp': data.get('org', 'Unknown').split(' ')[0] if data.get('org') else 'Unknown',
-                'org': data.get('org', 'Unknown'),
-                'asn': data.get('asn', {}).get('asn', 'Unknown') if isinstance(data.get('asn'), dict) else 'Unknown'
-            }
-            
-            # 尝试从org中提取ASN信息
-            if location_info['asn'] == 'Unknown' and location_info['org'] != 'Unknown':
-                asn_match = re.search(r'AS\d+', location_info['org'])
-                if asn_match:
-                    location_info['asn'] = asn_match.group()
-            
-            return location_info
-    except Exception as e:
-        # 失败时返回基本信息
+    """获取IP地址的地理位置信息，带有完整错误处理和备用API"""
+    # 参数验证
+    if not ip or not is_valid_ip(ip):
+        if COLOR_ENABLED:
+            print(Fore.RED + f"⚠️  无效的IP地址: {ip}{Style.RESET_ALL}")
+        else:
+            print(f"⚠️  无效的IP地址: {ip}")
         return {
-            'ip': ip,
+            'ip': ip or 'Invalid',
             'city': 'Unknown',
             'region': 'Unknown',
             'country': 'Unknown',
@@ -149,140 +163,401 @@ def get_geo_location(ip):
             'org': 'Unknown',
             'asn': 'Unknown'
         }
+    
+    # 定义备选API列表
+    api_endpoints = [
+        {
+            'url': f"https://ipinfo.io/{ip}/json",
+            'headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+            'parser': lambda data: {
+                'ip': data.get('ip', ip),
+                'city': data.get('city', 'Unknown'),
+                'region': data.get('region', 'Unknown'),
+                'country': data.get('country', 'Unknown'),
+                'isp': data.get('org', 'Unknown').split(' ')[0] if data.get('org') else 'Unknown',
+                'org': data.get('org', 'Unknown'),
+                'asn': data.get('asn', {}).get('asn', 'Unknown') if isinstance(data.get('asn'), dict) else 'Unknown'
+            }
+        },
+        {
+            'url': f"http://ip-api.com/json/{ip}",
+            'headers': {'User-Agent': 'Mozilla/5.0'}, 
+            'parser': lambda data: {
+                'ip': data.get('query', ip),
+                'city': data.get('city', 'Unknown'),
+                'region': data.get('regionName', 'Unknown'),
+                'country': data.get('country', 'Unknown'),
+                'isp': data.get('isp', 'Unknown'),
+                'org': data.get('org', 'Unknown'),
+                'asn': data.get('as', 'Unknown')
+            }
+        }
+    ]
+    
+    # 遍历所有API，直到找到有效结果
+    for i, api in enumerate(api_endpoints):
+        try:
+            req = urllib.request.Request(api['url'], headers=api['headers'])
+            with urllib.request.urlopen(req, timeout=3) as response:
+                # 检查响应状态码
+                if response.status != 200:
+                    continue
+                
+                # 尝试解析JSON
+                data = json.loads(response.read().decode('utf-8', errors='replace'))
+                
+                # 解析数据
+                result = api['parser'](data)
+                
+                # 验证结果是否合理
+                if result['ip'] and (result['country'] != 'Unknown' or result['isp'] != 'Unknown'):
+                    # 尝试从org中提取ASN信息
+                    if result['asn'] == 'Unknown' and result['org'] != 'Unknown':
+                        asn_match = re.search(r'AS\d+', result['org'])
+                        if asn_match:
+                            result['asn'] = asn_match.group()
+                    return result
+        except urllib.error.URLError as e:
+            if COLOR_ENABLED:
+                print(Fore.RED + f"⚠️  API调用失败 ({i+1}/2): URL错误 - {str(e)}{Style.RESET_ALL}")
+            else:
+                print(f"⚠️  API调用失败 ({i+1}/2): URL错误 - {str(e)}")
+        except urllib.error.HTTPError as e:
+            if COLOR_ENABLED:
+                print(Fore.RED + f"⚠️  API调用失败 ({i+1}/2): HTTP错误 {e.code}{Style.RESET_ALL}")
+            else:
+                print(f"⚠️  API调用失败 ({i+1}/2): HTTP错误 {e.code}")
+        except json.JSONDecodeError:
+            if COLOR_ENABLED:
+                print(Fore.RED + f"⚠️  API调用失败 ({i+1}/2): 无效的JSON响应{Style.RESET_ALL}")
+            else:
+                print(f"⚠️  API调用失败 ({i+1}/2): 无效的JSON响应")
+        except socket.timeout:
+            if COLOR_ENABLED:
+                print(Fore.RED + f"⚠️  API调用失败 ({i+1}/2): 连接超时{Style.RESET_ALL}")
+            else:
+                print(f"⚠️  API调用失败 ({i+1}/2): 连接超时")
+        except Exception as e:
+            if COLOR_ENABLED:
+                print(Fore.RED + f"⚠️  API调用失败 ({i+1}/2): {str(e)}{Style.RESET_ALL}")
+            else:
+                print(f"⚠️  API调用失败 ({i+1}/2): {str(e)}")
+        
+        # 避免频繁请求
+        time.sleep(0.5)
+    
+    # 所有API都失败时，返回本地IP信息推断
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        # 检查是否为私有IP
+        if ip_obj.is_private:
+            return {
+                'ip': ip,
+                'city': '本地',
+                'region': '内部网络',
+                'country': '内网',
+                'isp': '本地网络',
+                'org': '私有网络',
+                'asn': 'Unknown'
+            }
+        # 检查是否为环回地址
+        elif ip_obj.is_loopback:
+            return {
+                'ip': ip,
+                'city': '本机',
+                'region': '本机',
+                'country': '本地',
+                'isp': '本机',
+                'org': '本机',
+                'asn': 'Unknown'
+            }
+    except ValueError:
+        pass
+    
+    if COLOR_ENABLED:
+        print(Fore.YELLOW + "⚠️  所有地理位置API均失败，使用基本信息" + Style.RESET_ALL)
+    else:
+        print("⚠️  所有地理位置API均失败，使用基本信息")
+        
+    return {
+        'ip': ip,
+        'city': 'Unknown',
+        'region': 'Unknown',
+        'country': 'Unknown',
+        'isp': 'Unknown',
+        'org': 'Unknown',
+        'asn': 'Unknown'
+    }
 
 def perform_whois_query(domain):
-    """执行WHOIS查询获取域名注册信息"""
-    try:
-        # 提取顶级域名以选择合适的WHOIS服务器
-        tld = domain.split('.')[-1]
-        
-        # WHOIS服务器映射
-        whois_servers = {
-            'com': 'whois.verisign-grs.com',
-            'net': 'whois.verisign-grs.com',
-            'org': 'whois.pir.org',
-            'io': 'whois.nic.io',
-            'cn': 'whois.cnnic.cn',
-            'co': 'whois.nic.co',
-            'uk': 'whois.nic.uk',
-            'us': 'whois.nic.us',
-            'ru': 'whois.tcinet.ru',
-            'de': 'whois.denic.de',
-            'jp': 'whois.jprs.jp'
-        }
-        
-        # 默认WHOIS服务器
-        whois_server = whois_servers.get(tld, 'whois.arin.net')
-        
-        # 创建套接字连接到WHOIS服务器
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect((whois_server, 43))
-        
-        # 发送查询命令
-        sock.send(f"{domain}\r\n".encode())
-        
-        # 接收响应
-        response = b''
-        while True:
-            data = sock.recv(4096)
-            if not data:
-                break
-            response += data
-        sock.close()
-        
-        # 解码响应
-        whois_data = response.decode('utf-8', errors='replace')
-        
-        # 解析WHOIS数据
-        whois_info = {
-            'registrar': 'Unknown',
-            'created': 'Unknown',
-            'expires': 'Unknown',
-            'updated': 'Unknown',
-            'nameservers': [],
-            'domain_status': []
-        }
-        
-        # 正则表达式匹配关键信息
-        patterns = {
-            'registrar': [
-                r'Registrar:\s*(.*)',
-                r'registrar:\s*(.*)',
-                r'Registered through:\s*(.*)'
-            ],
-            'created': [
-                r'Creation Date:\s*(.*)',
-                r'Created On:\s*(.*)',
-                r'created:\s*(.*)',
-                r'Registration Date:\s*(.*)'
-            ],
-            'expires': [
-                r'Expiration Date:\s*(.*)',
-                r'Expires On:\s*(.*)',
-                r'expires:\s*(.*)',
-                r'Registration Expiration Date:\s*(.*)'
-            ],
-            'updated': [
-                r'Updated Date:\s*(.*)',
-                r'Last Updated On:\s*(.*)',
-                r'updated:\s*(.*)'
-            ]
-        }
-        
-        # 提取基本信息
-        for key, key_patterns in patterns.items():
-            for pattern in key_patterns:
-                match = re.search(pattern, whois_data, re.IGNORECASE)
-                if match:
-                    whois_info[key] = match.group(1).strip()
-                    break
-        
-        # 提取域名服务器
-        nameserver_patterns = [
-            r'Name Server:\s*(.*)',
-            r'name server:\s*(.*)',
-            r'Nameservers:\s*(.*)'
-        ]
-        for pattern in nameserver_patterns:
-            for match in re.finditer(pattern, whois_data, re.IGNORECASE):
-                ns = match.group(1).strip()
-                if ns and ns not in whois_info['nameservers']:
-                    whois_info['nameservers'].append(ns)
-        
-        # 提取域名状态
-        status_patterns = [
-            r'Domain Status:\s*(.*)',
-            r'domain status:\s*(.*)',
-            r'Status:\s*(.*)'
-        ]
-        for pattern in status_patterns:
-            for match in re.finditer(pattern, whois_data, re.IGNORECASE):
-                status = match.group(1).strip()
-                if status and status not in whois_info['domain_status']:
-                    whois_info['domain_status'].append(status)
-        
-        return whois_info
-    except Exception as e:
-        print(f"⚠️ WHOIS查询失败: {str(e)}")
+    """执行WHOIS查询获取域名注册信息，带有完整错误处理和备用策略"""
+    # 检查域名格式
+    if not domain or not isinstance(domain, str) or len(domain) < 3 or '.' not in domain:
+        if COLOR_ENABLED:
+            print(Fore.RED + f"⚠️  无效的域名格式: {domain or 'None'}{Style.RESET_ALL}")
+        else:
+            print(f"⚠️  无效的域名格式: {domain or 'None'}")
         return {
-            'registrar': 'Unknown',
+            'registrar': 'Invalid Domain',
             'created': 'Unknown',
             'expires': 'Unknown',
             'updated': 'Unknown',
             'nameservers': [],
             'domain_status': []
         }
+    
+    # 清理域名
+    domain = domain.strip().lower()
+    
+    # 默认返回值
+    result = {
+        'registrar': 'Unknown',
+        'created': 'Unknown',
+        'expires': 'Unknown',
+        'updated': 'Unknown',
+        'nameservers': [],
+        'domain_status': []
+    }
+    
+    # 扩展的WHOIS服务器列表
+    whois_servers = {
+        'com': 'whois.verisign-grs.com',
+        'net': 'whois.verisign-grs.com',
+        'org': 'whois.pir.org',
+        'io': 'whois.nic.io',
+        'cn': 'whois.cnnic.cn',
+        'co': 'whois.nic.co',
+        'uk': 'whois.nic.uk',
+        'us': 'whois.nic.us',
+        'ru': 'whois.tcinet.ru',
+        'de': 'whois.denic.de',
+        'jp': 'whois.jprs.jp',
+        'info': 'whois.afilias.net',
+        'biz': 'whois.neulevel.biz',
+        'cc': 'whois.nic.cc',
+        'tv': 'whois.nic.tv',
+        'me': 'whois.nic.me',
+        'in': 'whois.inregistry.net',
+        'fr': 'whois.nic.fr',
+        'au': 'whois.auda.org.au'
+    }
+    
+    # 获取TLD
+    tld = domain.split('.')[-1]
+    
+    # 尝试多个WHOIS服务器
+    servers_to_try = []
+    if tld in whois_servers:
+        servers_to_try.append(whois_servers[tld])
+    # 添加通用备用服务器
+    servers_to_try.extend(['whois.arin.net', 'whois.internic.net', 'whois.iana.org'])
+    
+    for i, server in enumerate(servers_to_try):
+        try:
+            if COLOR_ENABLED:
+                print(Fore.BLUE + f"🔄 尝试WHOIS服务器 ({i+1}/{len(servers_to_try)}): {server}{Style.RESET_ALL}")
+            
+            # 创建套接字
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                
+                # 连接服务器
+                sock.connect((server, 43))
+                
+                # 发送查询
+                query = f"{domain}\r\n"
+                sock.send(query.encode('utf-8'))
+                
+                # 接收响应
+                response = b''
+                while True:
+                    try:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        response += chunk
+                        # 防止接收过多数据
+                        if len(response) > 102400:  # 100KB限制
+                            break
+                    except socket.timeout:
+                        break
+                
+                # 解码响应
+                whois_data = response.decode('utf-8', errors='replace')
+                
+                # 检查是否有有效响应
+                if len(whois_data) < 100 or 'No match for' in whois_data or 'not found' in whois_data:
+                    continue
+                
+                # 解析数据
+                if parse_whois_data(whois_data, result):
+                    # 验证是否获取到有用信息
+                    if (result['registrar'] != 'Unknown' or 
+                        result['created'] != 'Unknown' or 
+                        len(result['nameservers']) > 0):
+                        return result
+                        
+        except socket.timeout:
+            if COLOR_ENABLED:
+                print(Fore.RED + f"⚠️  WHOIS查询超时: {server}{Style.RESET_ALL}")
+            else:
+                print(f"⚠️  WHOIS查询超时: {server}")
+        except socket.error as e:
+            if COLOR_ENABLED:
+                print(Fore.RED + f"⚠️  WHOIS网络错误: {str(e)}{Style.RESET_ALL}")
+            else:
+                print(f"⚠️  WHOIS网络错误: {str(e)}")
+        except Exception as e:
+            if COLOR_ENABLED:
+                print(Fore.RED + f"⚠️  WHOIS查询错误: {str(e)}{Style.RESET_ALL}")
+            else:
+                print(f"⚠️  WHOIS查询错误: {str(e)}")
+        
+        # 等待一段时间再尝试下一个服务器
+        time.sleep(0.5)
+    
+    if COLOR_ENABLED:
+        print(Fore.YELLOW + "⚠️  所有WHOIS服务器查询失败，返回基本信息" + Style.RESET_ALL)
+    else:
+        print("⚠️  所有WHOIS服务器查询失败，返回基本信息")
+        
+    return result
+
+def parse_whois_data(whois_data, result):
+    """解析WHOIS数据"""
+    if not whois_data:
+        return False
+    
+    # 增强的正则表达式模式
+    patterns = {
+        'registrar': [
+            r'Registrar:\s*(.+?)\s*(?:\n|$)',
+            r'registrar:\s*(.+?)\s*(?:\n|$)',
+            r'Registered through:\s*(.+?)\s*(?:\n|$)',
+            r'Sponsoring Registrar:\s*(.+?)\s*(?:\n|$)',
+            r'sponsoring registrar:\s*(.+?)\s*(?:\n|$)',
+            r'注册商:\s*(.+?)\s*(?:\n|$)'
+        ],
+        'created': [
+            r'Creation Date:\s*(.+?)\s*(?:\n|$)',
+            r'Created On:\s*(.+?)\s*(?:\n|$)',
+            r'created:\s*(.+?)\s*(?:\n|$)',
+            r'Registration Date:\s*(.+?)\s*(?:\n|$)',
+            r'注册时间:\s*(.+?)\s*(?:\n|$)',
+            r'Created Date:\s*(.+?)\s*(?:\n|$)'
+        ],
+        'expires': [
+            r'Expiration Date:\s*(.+?)\s*(?:\n|$)',
+            r'Expires On:\s*(.+?)\s*(?:\n|$)',
+            r'expires:\s*(.+?)\s*(?:\n|$)',
+            r'Registration Expiration Date:\s*(.+?)\s*(?:\n|$)',
+            r'到期时间:\s*(.+?)\s*(?:\n|$)',
+            r'Expire Date:\s*(.+?)\s*(?:\n|$)'
+        ],
+        'updated': [
+            r'Updated Date:\s*(.+?)\s*(?:\n|$)',
+            r'Last Updated On:\s*(.+?)\s*(?:\n|$)',
+            r'updated:\s*(.+?)\s*(?:\n|$)',
+            r'Last modified:\s*(.+?)\s*(?:\n|$)',
+            r'更新时间:\s*(.+?)\s*(?:\n|$)'
+        ]
+    }
+    
+    # 提取基本信息
+    for key, key_patterns in patterns.items():
+        for pattern in key_patterns:
+            match = re.search(pattern, whois_data, re.IGNORECASE | re.MULTILINE)
+            if match:
+                value = match.group(1).strip()
+                # 清理值
+                if value and len(value) > 1:
+                    result[key] = value
+                    # 尝试标准化日期格式
+                    if key in ['created', 'expires', 'updated']:
+                        try:
+                            # 尝试几种常见的日期格式
+                            for fmt in ['%Y-%m-%d', '%d-%b-%Y', '%b %d %Y', '%Y/%m/%d', '%Y%m%d']:
+                                try:
+                                    # 只取日期部分
+                                    date_part = value.split('T')[0].split(' ')[0].strip()
+                                    dt = datetime.strptime(date_part, fmt)
+                                    result[key] = dt.strftime('%Y-%m-%d')
+                                    break
+                                except ValueError:
+                                    continue
+                        except Exception:
+                            pass  # 保持原始格式
+                break
+    
+    # 提取域名服务器
+    nameserver_patterns = [
+        r'Name Server:\s*(.+?)\s*(?:\n|$)',
+        r'name server:\s*(.+?)\s*(?:\n|$)',
+        r'Nameservers:\s*(.+?)\s*(?:\n|$)',
+        r'NS\s*\d*:\s*(.+?)\s*(?:\n|$)',
+        r'domain nameservers:\s*(.+?)\s*(?:\n|$)'
+    ]
+    
+    nameservers = set()
+    for pattern in nameserver_patterns:
+        for match in re.finditer(pattern, whois_data, re.IGNORECASE | re.MULTILINE):
+            ns = match.group(1).strip('.').lower()
+            if ns and len(ns) > 3:
+                nameservers.add(ns)
+    
+    result['nameservers'] = list(nameservers)[:10]  # 限制数量
+    
+    # 提取域名状态
+    status_patterns = [
+        r'Domain Status:\s*(.+?)\s*(?:\n|$)',
+        r'domain status:\s*(.+?)\s*(?:\n|$)',
+        r'Status:\s*(.+?)\s*(?:\n|$)',
+        r'status:\s*(.+?)\s*(?:\n|$)'
+    ]
+    
+    statuses = set()
+    for pattern in status_patterns:
+        for match in re.finditer(pattern, whois_data, re.IGNORECASE | re.MULTILINE):
+            status = match.group(1).strip()
+            if status and len(status) > 2:
+                statuses.add(status)
+    
+    result['domain_status'] = list(statuses)[:5]  # 限制数量
+    
+    return True
 
 def scan_port(ip, port, timeout=1):
-    """扫描单个端口是否开放"""
+    """扫描单个端口是否开放，带有错误处理"""
+    # 参数验证
+    if not ip or not isinstance(port, int) or port < 1 or port > 65535:
+        return False
+    
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        result = sock.connect_ex((ip, port))
-        sock.close()
-        return result == 0
+        # 使用上下文管理器确保套接字正确关闭
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            # 设置超时
+            sock.settimeout(timeout)
+            
+            # 使用非阻塞模式避免长时间等待
+            sock.setblocking(False)
+            
+            # 尝试连接
+            try:
+                sock.connect((ip, port))
+            except BlockingIOError:
+                # 正常的非阻塞连接行为
+                pass
+            
+            # 使用select检查连接是否成功
+            ready = select.select([], [sock], [], timeout)
+            if ready[1]:  # 如果套接字可写，则连接成功
+                return True
+            return False
+    except (socket.error, TypeError, ValueError):
+        # 捕获所有网络错误和类型错误
+        return False
     except Exception:
+        # 捕获其他所有异常
         return False
 
 def identify_service(ip, port, timeout=2):
